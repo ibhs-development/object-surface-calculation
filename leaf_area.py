@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Measure leaf surface area in a photograph using an ArUco scale marker.
+"""Measure one or more leaf surface areas using an ArUco scale marker.
 
-The leaf and marker must lie on the same flat plane.  The marker's four corners
+The leaves and marker must lie on the same flat plane. The marker's four corners
 define an image-to-centimetre homography, so the result is corrected for camera
 tilt as well as scale.
 """
@@ -41,8 +41,16 @@ class MeasurementError(RuntimeError):
 
 @dataclass(frozen=True)
 class LeafMeasurement:
+    leaf_number: int
+    area_cm2: float
+
+
+@dataclass(frozen=True)
+class ImageMeasurement:
     image: str
     area_cm2: float
+    leaf_count: int
+    leaves: list[LeafMeasurement]
     marker_id: int
     marker_size_cm: float
     marker_edge_pixels: list[float]
@@ -50,9 +58,14 @@ class LeafMeasurement:
 
 @dataclass
 class Analysis:
-    measurement: LeafMeasurement
+    measurement: ImageMeasurement
     annotated_image: np.ndarray
     leaf_mask: np.ndarray
+
+    @property
+    def measurements(self) -> list[LeafMeasurement]:
+        """Individual leaf measurements, in top-to-bottom reading order."""
+        return self.measurement.leaves
 
 
 def _aruco_dictionary(name: str):
@@ -108,8 +121,8 @@ def _make_leaf_mask(
     marker_corners: np.ndarray,
     min_saturation: int,
     max_dark_value: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Return a filled mask and the selected outer leaf contour."""
+) -> tuple[np.ndarray, list[np.ndarray]]:
+    """Return the segmented foreground and all plausible leaf contours."""
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
     saturation = hsv[:, :, 1]
     value = hsv[:, :, 2]
@@ -155,21 +168,37 @@ def _make_leaf_mask(
         foreground, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE
     )
     image_area = image.shape[0] * image.shape[1]
-    candidates = [
-        contour
-        for contour in contours
-        if cv2.contourArea(contour) >= image_area * 0.0001
-    ]
+    height, width = foreground.shape
+    candidates = []
+    for contour in contours:
+        if cv2.contourArea(contour) < image_area * 0.0001:
+            continue
+        x, y, contour_width, contour_height = cv2.boundingRect(contour)
+        # A measurable leaf must be completely visible. Border-connected regions
+        # are normally the edge of the paper, a shadow, or the surrounding scene.
+        if (
+            x <= 0
+            or y <= 0
+            or x + contour_width >= width
+            or y + contour_height >= height
+        ):
+            continue
+        candidates.append(contour)
     if not candidates:
         raise MeasurementError(
             "No leaf-sized object was segmented. Try lowering --min-saturation or "
             "raising --max-dark-value."
         )
 
-    leaf_contour = max(candidates, key=cv2.contourArea)
-    leaf_mask = np.zeros(foreground.shape, dtype=np.uint8)
-    cv2.drawContours(leaf_mask, [leaf_contour], -1, 255, cv2.FILLED)
-    return leaf_mask, leaf_contour
+    # OpenCV does not promise contour order. Number leaves predictably from top
+    # to bottom and then left to right so annotations, CSV, and JSON agree.
+    candidates.sort(
+        key=lambda contour: (
+            cv2.boundingRect(contour)[1],
+            cv2.boundingRect(contour)[0],
+        )
+    )
+    return foreground, candidates
 
 
 def analyze_image(
@@ -180,11 +209,14 @@ def analyze_image(
     dictionary: str = "6X6_250",
     min_saturation: int = 35,
     max_dark_value: int = 180,
+    min_leaf_area_cm2: float = 0.25,
 ) -> Analysis:
-    """Analyze one image and return its metric area and diagnostic images."""
+    """Analyze one image and return per-leaf areas and diagnostic images."""
     path = Path(image_path)
     if marker_size_cm <= 0:
         raise MeasurementError("--marker-size-cm must be greater than zero.")
+    if min_leaf_area_cm2 <= 0:
+        raise MeasurementError("--min-leaf-area-cm2 must be greater than zero.")
     if not 0 <= min_saturation <= 255 or not 0 <= max_dark_value <= 255:
         raise MeasurementError("Segmentation thresholds must be between 0 and 255.")
 
@@ -195,7 +227,7 @@ def analyze_image(
         raise MeasurementError(f"Could not read image: {path}")
 
     marker_corners, detected_id = _detect_marker(image, dictionary, marker_id)
-    leaf_mask, leaf_contour = _make_leaf_mask(
+    _, candidate_contours = _make_leaf_mask(
         image, marker_corners, min_saturation, max_dark_value
     )
 
@@ -209,54 +241,85 @@ def analyze_image(
         dtype=np.float32,
     )
     image_to_cm = cv2.getPerspectiveTransform(marker_corners, metric_corners)
-    metric_contour = cv2.perspectiveTransform(
-        leaf_contour.astype(np.float32), image_to_cm
-    )
-    area_cm2 = abs(float(cv2.contourArea(metric_contour)))
-    if not np.isfinite(area_cm2) or area_cm2 <= 0:
-        raise MeasurementError("The computed leaf area is invalid.")
+    measured_contours: list[tuple[np.ndarray, float]] = []
+    for contour in candidate_contours:
+        metric_contour = cv2.perspectiveTransform(
+            contour.astype(np.float32), image_to_cm
+        )
+        area_cm2 = abs(float(cv2.contourArea(metric_contour)))
+        if np.isfinite(area_cm2) and area_cm2 >= min_leaf_area_cm2:
+            measured_contours.append((contour, area_cm2))
+
+    if not measured_contours:
+        raise MeasurementError(
+            "No leaf met the minimum area threshold. Try lowering "
+            "--min-leaf-area-cm2."
+        )
+
+    leaves = [
+        LeafMeasurement(leaf_number=index, area_cm2=round(area, 3))
+        for index, (_, area) in enumerate(measured_contours, start=1)
+    ]
+    total_area_cm2 = round(sum(leaf.area_cm2 for leaf in leaves), 3)
 
     edge_lengths = np.linalg.norm(
         marker_corners - np.roll(marker_corners, -1, axis=0), axis=1
     )
-    measurement = LeafMeasurement(
+    measurement = ImageMeasurement(
         image=str(path),
-        area_cm2=round(area_cm2, 3),
+        area_cm2=total_area_cm2,
+        leaf_count=len(leaves),
+        leaves=leaves,
         marker_id=detected_id,
         marker_size_cm=marker_size_cm,
         marker_edge_pixels=[round(float(length), 1) for length in edge_lengths],
     )
 
     annotated = image.copy()
-    cv2.drawContours(annotated, [leaf_contour], -1, (0, 0, 255), 8)
+    leaf_mask = np.zeros(image.shape[:2], dtype=np.uint8)
+    line_width = max(2, int(round(min(image.shape[:2]) * 0.0027)))
+    font_scale = min(1.35, max(0.55, image.shape[1] / 2200.0))
+    font_thickness = max(1, int(round(font_scale * 2)))
+    for leaf, (leaf_contour, _) in zip(leaves, measured_contours):
+        cv2.drawContours(leaf_mask, [leaf_contour], -1, 255, cv2.FILLED)
+        cv2.drawContours(
+            annotated, [leaf_contour], -1, (0, 0, 255), line_width, cv2.LINE_AA
+        )
+
+        x, y, _, _ = cv2.boundingRect(leaf_contour)
+        label = f"Leaf {leaf.leaf_number}: {leaf.area_cm2:.2f} cm^2"
+        (text_width, text_height), _ = cv2.getTextSize(
+            label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thickness
+        )
+        text_x = min(max(10, x), max(10, image.shape[1] - text_width - 10))
+        text_y = max(text_height + 10, y - 14)
+        cv2.putText(
+            annotated,
+            label,
+            (text_x, text_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font_scale,
+            (255, 255, 255),
+            font_thickness + 4,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            annotated,
+            label,
+            (text_x, text_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font_scale,
+            (0, 0, 255),
+            font_thickness,
+            cv2.LINE_AA,
+        )
+
     cv2.polylines(
         annotated,
         [np.rint(marker_corners).astype(np.int32)],
         True,
         (255, 0, 255),
-        8,
-        cv2.LINE_AA,
-    )
-    anchor = tuple(np.rint(leaf_contour[:, 0, :].min(axis=0)).astype(int))
-    text_y = max(45, anchor[1] - 24)
-    cv2.putText(
-        annotated,
-        f"Leaf area: {area_cm2:.2f} cm^2",
-        (max(10, anchor[0]), text_y),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        1.35,
-        (255, 255, 255),
-        7,
-        cv2.LINE_AA,
-    )
-    cv2.putText(
-        annotated,
-        f"Leaf area: {area_cm2:.2f} cm^2",
-        (max(10, anchor[0]), text_y),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        1.35,
-        (0, 0, 255),
-        3,
+        line_width,
         cv2.LINE_AA,
     )
     return Analysis(measurement, annotated, leaf_mask)
@@ -268,12 +331,42 @@ def _write_image(path: Path, image: np.ndarray, description: str) -> None:
         raise MeasurementError(f"Could not write {description}: {path}")
 
 
-def _write_results_csv(path: Path, rows: list[dict[str, str]]) -> None:
+CSV_FIELDS = [
+    "image_name",
+    "leaf_number",
+    "leaf_area_cm2",
+    "leaf_count",
+    "total_area_cm2",
+    "status",
+    "error",
+]
+
+
+def _measurement_rows(
+    measurement: ImageMeasurement, image_name: str
+) -> list[dict[str, str | int]]:
+    return [
+        {
+            "image_name": image_name,
+            "leaf_number": leaf.leaf_number,
+            "leaf_area_cm2": f"{leaf.area_cm2:.3f}",
+            "leaf_count": measurement.leaf_count,
+            "total_area_cm2": f"{measurement.area_cm2:.3f}",
+            "status": "ok",
+            "error": "",
+        }
+        for leaf in measurement.leaves
+    ]
+
+
+def _write_results_csv(
+    path: Path, rows: list[dict[str, str | int]]
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as csv_file:
         writer = csv.DictWriter(
             csv_file,
-            fieldnames=["image_name", "leaf_area_cm2", "status", "error"],
+            fieldnames=CSV_FIELDS,
         )
         writer.writeheader()
         writer.writerows(rows)
@@ -304,6 +397,8 @@ def process_folder(
     dictionary: str = "6X6_250",
     min_saturation: int = 35,
     max_dark_value: int = 180,
+    min_leaf_area_cm2: float = 0.25,
+    progress: bool = True,
 ) -> tuple[Path, int, int]:
     """Process images in a folder and return CSV path, successes, and failures."""
     source = Path(input_dir)
@@ -321,17 +416,19 @@ def process_folder(
     csv_path = Path(csv_output) if csv_output else destination / "leaf_areas.csv"
     destination.mkdir(parents=True, exist_ok=True)
     csv_path.parent.mkdir(parents=True, exist_ok=True)
-    rows: list[dict[str, str]] = []
+    rows: list[dict[str, str | int]] = []
     succeeded = 0
     failed = 0
 
-    print(f"Found {len(images)} image(s) in {source}", flush=True)
+    if progress:
+        print(f"Found {len(images)} image(s) in {source}", flush=True)
     for index, image_path in enumerate(images, start=1):
         relative_path = image_path.relative_to(source)
-        print(
-            f"[{index}/{len(images)}] Processing {relative_path} ...",
-            flush=True,
-        )
+        if progress:
+            print(
+                f"[{index}/{len(images)}] Processing {relative_path} ...",
+                flush=True,
+            )
         output_subdir = destination / relative_path.parent
         measured_path = output_subdir / f"{image_path.stem}_measured.jpg"
         mask_path = output_subdir / f"{image_path.stem}_mask.png"
@@ -343,6 +440,7 @@ def process_folder(
                 dictionary=dictionary,
                 min_saturation=min_saturation,
                 max_dark_value=max_dark_value,
+                min_leaf_area_cm2=min_leaf_area_cm2,
             )
             _write_image(measured_path, analysis.annotated_image, "annotated image")
             _write_image(mask_path, analysis.leaf_mask, "mask image")
@@ -351,34 +449,35 @@ def process_folder(
             rows.append(
                 {
                     "image_name": str(relative_path),
+                    "leaf_number": "",
                     "leaf_area_cm2": "",
+                    "leaf_count": "",
+                    "total_area_cm2": "",
                     "status": "error",
                     "error": str(exc),
                 }
             )
-            print(f"    ERROR: {exc}", flush=True)
+            if progress:
+                print(f"    ERROR: {exc}", flush=True)
             continue
 
         succeeded += 1
-        rows.append(
-            {
-                "image_name": str(relative_path),
-                "leaf_area_cm2": f"{analysis.measurement.area_cm2:.3f}",
-                "status": "ok",
-                "error": "",
-            }
-        )
-        print(
-            f"    Done: {analysis.measurement.area_cm2:.3f} cm^2",
-            flush=True,
-        )
+        rows.extend(_measurement_rows(analysis.measurement, str(relative_path)))
+        if progress:
+            noun = "leaf" if analysis.measurement.leaf_count == 1 else "leaves"
+            print(
+                f"    Done: {analysis.measurement.leaf_count} {noun}, "
+                f"total {analysis.measurement.area_cm2:.3f} cm^2",
+                flush=True,
+            )
 
     _write_results_csv(csv_path, rows)
 
-    print(
-        f"Finished: {succeeded} succeeded, {failed} failed. CSV: {csv_path}",
-        flush=True,
-    )
+    if progress:
+        print(
+            f"Finished: {succeeded} succeeded, {failed} failed. CSV: {csv_path}",
+            flush=True,
+        )
     return csv_path, succeeded, failed
 
 
@@ -397,7 +496,9 @@ def _parse_args() -> argparse.Namespace:
         default=5.0,
         help="physical side length of the marker's black square (default: 5.0)",
     )
-    parser.add_argument("--marker-id", type=int, default=23, help="marker ID (default: 23)")
+    parser.add_argument(
+        "--marker-id", type=int, default=23, help="marker ID (default: 23)"
+    )
     parser.add_argument(
         "--dictionary", default="6X6_250", help="ArUco dictionary (default: 6X6_250)"
     )
@@ -414,16 +515,26 @@ def _parse_args() -> argparse.Namespace:
         help="maximum HSV value treated as non-white/leaf (default: 180)",
     )
     parser.add_argument(
+        "--min-leaf-area-cm2",
+        type=float,
+        default=0.25,
+        help="ignore segmented objects smaller than this area (default: 0.25)",
+    )
+    parser.add_argument(
         "--output",
         type=Path,
-        help="single-image annotated output (default: leaf_area_annotated.jpg)",
+        help="single-image annotated output (default: OUTPUT_DIR/NAME_measured.jpg)",
     )
-    parser.add_argument("--mask-output", type=Path, help="single-image leaf mask path")
+    parser.add_argument(
+        "--mask-output",
+        type=Path,
+        help="single-image mask output (default: beside annotated image)",
+    )
     parser.add_argument(
         "--output-dir",
         type=Path,
         default=Path("output"),
-        help="batch measured/mask output folder (default: output)",
+        help="measured/mask output folder (default: output)",
     )
     parser.add_argument(
         "--csv-output",
@@ -438,7 +549,9 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="also process images in subfolders during batch mode",
     )
-    parser.add_argument("--json", action="store_true", help="print machine-readable JSON")
+    parser.add_argument(
+        "--json", action="store_true", help="print machine-readable JSON"
+    )
     return parser.parse_args()
 
 
@@ -463,6 +576,8 @@ def main() -> int:
                 dictionary=args.dictionary,
                 min_saturation=args.min_saturation,
                 max_dark_value=args.max_dark_value,
+                min_leaf_area_cm2=args.min_leaf_area_cm2,
+                progress=not args.json,
             )
         except MeasurementError as exc:
             print(f"error: {exc}", file=sys.stderr)
@@ -482,8 +597,20 @@ def main() -> int:
             )
         return 1 if failed else 0
 
-    output_path = args.output or Path("leaf_area_annotated.jpg")
-    csv_path = args.csv_output or output_path.with_suffix(".csv")
+    if args.output:
+        output_path = args.output
+        default_csv_path = output_path.with_suffix(".csv")
+    else:
+        output_path = args.output_dir / f"{args.input_path.stem}_measured.jpg"
+        default_csv_path = args.output_dir / f"{args.input_path.stem}_leaf_areas.csv"
+    if args.mask_output:
+        mask_path = args.mask_output
+    else:
+        mask_stem = output_path.stem
+        if mask_stem.lower().endswith("_measured"):
+            mask_stem = mask_stem[: -len("_measured")]
+        mask_path = output_path.with_name(f"{mask_stem}_mask.png")
+    csv_path = args.csv_output or default_csv_path
     try:
         analysis = analyze_image(
             args.input_path,
@@ -492,37 +619,35 @@ def main() -> int:
             dictionary=args.dictionary,
             min_saturation=args.min_saturation,
             max_dark_value=args.max_dark_value,
+            min_leaf_area_cm2=args.min_leaf_area_cm2,
         )
         _write_image(output_path, analysis.annotated_image, "annotated image")
-        if args.mask_output:
-            _write_image(args.mask_output, analysis.leaf_mask, "mask image")
+        _write_image(mask_path, analysis.leaf_mask, "mask image")
         _write_results_csv(
             csv_path,
-            [
-                {
-                    "image_name": args.input_path.name,
-                    "leaf_area_cm2": f"{analysis.measurement.area_cm2:.3f}",
-                    "status": "ok",
-                    "error": "",
-                }
-            ],
+            _measurement_rows(analysis.measurement, args.input_path.name),
         )
     except MeasurementError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
     result = asdict(analysis.measurement)
+    # Keep area_cm2 for API compatibility while making its aggregate meaning
+    # explicit for consumers of the new multi-leaf JSON format.
+    result["total_area_cm2"] = analysis.measurement.area_cm2
     result["annotated_image"] = str(output_path)
     result["csv"] = str(csv_path)
-    if args.mask_output:
-        result["mask_image"] = str(args.mask_output)
+    result["mask_image"] = str(mask_path)
     if args.json:
         print(json.dumps(result, indent=2))
     else:
-        print(f"Leaf area: {analysis.measurement.area_cm2:.3f} cm^2")
+        print(f"Image: {args.input_path}")
+        print(f"Leaves detected: {analysis.measurement.leaf_count}")
+        for leaf in analysis.measurements:
+            print(f"  Leaf {leaf.leaf_number}: {leaf.area_cm2:.3f} cm^2")
+        print(f"Total area: {analysis.measurement.area_cm2:.3f} cm^2")
         print(f"Annotated image: {output_path}")
-        if args.mask_output:
-            print(f"Leaf mask: {args.mask_output}")
+        print(f"Leaf mask: {mask_path}")
         print(f"CSV: {csv_path}")
     return 0
 

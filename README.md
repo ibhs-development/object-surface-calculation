@@ -1,9 +1,9 @@
 # Leaf area measurement
 
-This program measures the projected (one-sided) area of a flat leaf in square
-centimetres. It detects a known-size ArUco marker, uses all four marker corners
-to correct scale and perspective, segments the leaf from a white background,
-and saves an annotated result.
+This program measures the projected (one-sided) area of one or more flat leaves
+in square centimetres. It detects a known-size ArUco marker, uses all four marker
+corners to correct scale and perspective, segments each leaf from a white
+background, and saves annotated and mask images.
 
 ## Setup
 
@@ -16,18 +16,22 @@ python -m pip install -r requirements.txt
 
 ## Run
 
-The defaults match a 5 cm marker:
+The defaults match a 5 cm marker. For a single image, the output directory gets
+an annotated image, a combined leaf mask, and a CSV with one row per leaf:
 
 ```bash
-python leaf_area.py input/IMG_4659.JPG \
-  --output output/IMG_4659_measured.jpg \
-  --mask-output output/IMG_4659_mask.png
+python leaf_area.py input/IMG_4659.JPG --output-dir output
 ```
 
-The command prints the leaf area in cm² and creates
-`output/IMG_4659_measured.csv` with the image name and area. Use
-`--csv-output results.csv` to choose another CSV path. Add `--json` for
-structured terminal output.
+This creates `output/IMG_4659_measured.jpg`, `output/IMG_4659_mask.png`, and
+`output/IMG_4659_leaf_areas.csv`. The terminal output lists every detected leaf
+and their total area. Use `--output`, `--mask-output`, or `--csv-output` to
+choose individual paths. Add `--json` for machine-readable terminal output.
+
+Leaves are numbered from top to bottom, then left to right. The annotated image
+uses the same numbers as the CSV and JSON output. The CSV contains
+`leaf_number`, `leaf_area_cm2`, `leaf_count`, and `total_area_cm2`; the count and
+total repeat on each leaf row to make grouped analysis straightforward.
 
 ### Process a folder
 
@@ -42,13 +46,13 @@ While the command runs, it prints progress such as:
 ```text
 Found 3 image(s) in input
 [1/3] Processing leaf_01.jpg ...
-    Done: 17.051 cm^2
+    Done: 2 leaves, total 31.688 cm^2
 ```
 
 For each source image, batch mode creates
 `NAME_measured.jpg` and `NAME_mask.png`. It also creates
-`output/leaf_areas.csv` with the image name, area, status, and any error. A bad
-image is reported and recorded without stopping the rest of the batch.
+`output/leaf_areas.csv` with one row per detected leaf. A bad image gets one
+error row and does not stop the rest of the batch.
 
 Use `--csv-output results.csv` to choose another CSV path, or `--recursive` to
 include images in subfolders. Run `python leaf_area.py --help` for all marker
@@ -68,3 +72,8 @@ and segmentation options.
 For a pale leaf that is missed, lower `--min-saturation` (for example, `20`) or
 raise `--max-dark-value` (for example, `210`). Inspect the saved mask whenever
 you change these values: the white region should contain the leaf only.
+
+Small segmented specks below `0.25 cm²` are ignored by default. If you are
+measuring very small leaves, lower `--min-leaf-area-cm2`. Leaves must not touch
+one another or the image edge: touching leaves form one contour, while
+edge-connected regions are rejected as incomplete objects or background.
