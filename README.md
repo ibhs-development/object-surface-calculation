@@ -69,9 +69,12 @@ and segmentation options.
 - The result is the leaf's 2D projected area. Curled or folded leaves cannot be
   measured accurately from one photograph.
 
-For a pale leaf that is missed, lower `--min-saturation` (for example, `20`) or
-raise `--max-dark-value` (for example, `210`). Inspect the saved mask whenever
-you change these values: the white region should contain the leaf only.
+The default dark-value threshold is deliberately conservative so neutral gray
+shadows are not joined to a leaf. If a shadow is still included, lower
+`--max-dark-value` below `105`. For a pale leaf that is missed, first lower
+`--min-saturation` (for example, `20`); only raise `--max-dark-value` when the
+leaf has genuinely gray or nearly black edge tissue. Inspect the saved mask
+whenever you change these values: the white region should contain the leaf only.
 
 Small segmented specks below `0.25 cm²` are ignored by default. If you are
 measuring very small leaves, lower `--min-leaf-area-cm2`. Leaves must not touch

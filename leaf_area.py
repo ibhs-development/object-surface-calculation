@@ -208,7 +208,7 @@ def analyze_image(
     marker_id: int | None = 23,
     dictionary: str = "6X6_250",
     min_saturation: int = 35,
-    max_dark_value: int = 180,
+    max_dark_value: int = 105,
     min_leaf_area_cm2: float = 0.25,
 ) -> Analysis:
     """Analyze one image and return per-leaf areas and diagnostic images."""
@@ -396,7 +396,7 @@ def process_folder(
     marker_id: int | None = 23,
     dictionary: str = "6X6_250",
     min_saturation: int = 35,
-    max_dark_value: int = 180,
+    max_dark_value: int = 105,
     min_leaf_area_cm2: float = 0.25,
     progress: bool = True,
 ) -> tuple[Path, int, int]:
@@ -511,8 +511,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-dark-value",
         type=int,
-        default=180,
-        help="maximum HSV value treated as non-white/leaf (default: 180)",
+        default=105,
+        help=(
+            "maximum HSV value treated as very dark leaf tissue; lower values "
+            "reject more gray shadow (default: 105)"
+        ),
     )
     parser.add_argument(
         "--min-leaf-area-cm2",
